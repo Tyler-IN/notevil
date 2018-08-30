@@ -85,6 +85,7 @@ function evaluateAst(tree, context){
         var value = getFunction(node.body, params, blockContext)
         return context[node.id.name] = value
 
+      case 'ArrowFunctionExpression':
       case 'FunctionExpression':
         var params = node.params.map(getName)
         return getFunction(node.body, params, blockContext)
