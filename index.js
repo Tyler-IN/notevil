@@ -1,5 +1,7 @@
-var parse = require('esprima').parse
-var hoist = require('hoister')
+var esprima = require('esprima')
+var parse = esprima.parse
+var ReturnStatement = esprima.ReturnStatement
+var hoist = require('ast-hoist')
 
 var InfiniteChecker = require('./lib/infinite-checker')
 var Primitives = require('./lib/primitives')
@@ -8,8 +10,19 @@ module.exports = safeEval
 module.exports.eval = safeEval
 module.exports.FunctionFactory = FunctionFactory
 module.exports.Function = FunctionFactory()
+module.exports.returnFunctionString = returnFunctionString;
 
 var maxIterations = 1000000
+
+function returnFunctionString() {
+  if ('name' in this && typeof this.name === 'string')
+    return `function ${this.name}() { [native code] }`;
+  return 'function () { [native code] }';
+}
+
+function returnArrowFunctionString() {
+  return '() => { [native code] }';
+}
 
 // 'eval' with a controlled environment
 function safeEval(src, parentContext){
@@ -22,23 +35,22 @@ function safeEval(src, parentContext){
 function FunctionFactory(parentContext){
   var context = Object.create(parentContext || {})
   return function Function() {
-    // normalize arguments array
-    var args = Array.prototype.slice.call(arguments)
-    var src = args.slice(-1)[0]
-    args = args.slice(0,-1)
-    if (typeof src === 'string'){
-      //HACK: esprima doesn't like returns outside functions
-      src = parse('function a(){' + src + '}').body[0].body
+    var args = [...arguments]
+    var src = args.pop()
+    var code = 'function () { [native code] }';
+    if (typeof src === 'string') {
+      code = 'function () {\n' + src + '\n}';
+      src = parse('('+code+')').body[0].expression.body
     }
     var tree = prepareAst(src)
-    return getFunction(tree, args, context)
+    return getFunction(tree, args, context, code, '')
   }
 }
 
 // takes an AST or js source and returns an AST
 function prepareAst(src){
   var tree = (typeof src === 'string') ? parse(src) : src
-  return hoist(tree)
+  return hoist(tree, true)
 }
 
 // evaluate an AST in the given context
@@ -82,13 +94,15 @@ function evaluateAst(tree, context){
 
       case 'FunctionDeclaration':
         var params = node.params.map(getName)
-        var value = getFunction(node.body, params, blockContext)
+        var value = getFunction(node.body, params, blockContext, '', node.id.name)
         return context[node.id.name] = value
 
       case 'ArrowFunctionExpression':
+        if ( node.body.constructor.name !== 'BlockStatement' )
+          return getExprFunction(node.body, node.params.map(getName), blockContext)
+
       case 'FunctionExpression':
-        var params = node.params.map(getName)
-        return getFunction(node.body, params, blockContext)
+        return getFunction(node.body, node.params.map(getName), blockContext, '', node.id.name)
 
       case 'ReturnStatement':
         var value = walk(node.argument)
@@ -346,7 +360,11 @@ function evaluateAst(tree, context){
         if (node.callee.type === 'MemberExpression'){
           object = walk(node.callee.object)
         }
-        return target.apply(object, args)
+        if ( target === undefined )
+          return object;
+        if ( 'apply' in target )
+          return target.apply(object, args)
+        return target;
 
       case 'MemberExpression':
         var obj = walk(node.object)
@@ -479,31 +497,51 @@ function canSetProperty(object, property, primitives){
   }
 }
 
-// generate a function with specified context
-function getFunction(body, params, parentContext){
-  return function(){
-    var context = Object.create(parentContext)
-    if (this == global){
-      context['this'] = null
-    } else {
-      context['this'] = this
-    }
-    // normalize arguments array
-    var args = Array.prototype.slice.call(arguments)
-    context['arguments'] = arguments
-    args.forEach(function(arg,idx){
-      var param = params[idx]
-      if (param){
-        context[param] = arg
-      }
-    })
-    var result = evaluateAst(body, context)
 
-    if (result instanceof ReturnValue){
-      return result.value
-    }
+// generate a function with specified context
+function getFunction(body, params, parentContext, code, name){
+  var f = function(){
+    var context = Object.create(parentContext)
+    context.this = this === global ? null : this
+    context.arguments = arguments
+    var args = [...arguments];
+    for (const param of params)
+      if (param)
+        context[param] = args.shift()
+    var result = evaluateAst(body, context)
+    return (result instanceof ReturnValue
+      ? result.value
+      : undefined)
   }
+  if ( code )
+    Object.defineProperty(f, 'toString',
+      {value: function() { return code }})
+  else
+    Object.defineProperty(f, 'toString',
+      {value: returnFunctionString.bind({__proto__:f,name:name})})
+  return f;
 }
+
+function getExprFunction(expr, params, parentContext, code){
+  var f = function(){
+    var context = Object.create(parentContext)
+    context.this = this === global ? null : this
+    context.arguments = arguments
+    var args = [...arguments];
+    for (const param of params)
+      if (param)
+        context[param] = args.shift()
+    return evaluateAst(expr, context)
+  }
+  if ( code )
+    Object.setProperty(f, 'toString',
+      {value: function() { return code }})
+  else
+    Object.setProperty(f, 'toString',
+      {value: returnArrowFunctionString.bind(f)})
+  return f;
+}
+
 
 function finalValue(value){
   if (value instanceof ReturnValue){
